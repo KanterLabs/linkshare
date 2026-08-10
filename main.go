@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,30 +25,38 @@ import (
 )
 
 const (
-	maxBodyBytes = 16 << 10
-	defaultLimit = 50
-	maxLimit     = 200
-	defaultTTL   = 7 * 24 * time.Hour
+	maxBodyBytes        = 16 << 10
+	defaultLimit        = 50
+	maxLimit            = 200
+	defaultTTL          = 7 * 24 * time.Hour
+	defaultHistoryTTL   = 90 * 24 * time.Hour
 )
 
 //go:embed web/* web/assets/*
 var webFiles embed.FS
 
 type config struct {
-	Addr      string
-	DBPath    string
-	OwnerName string
-	LinkTTL   time.Duration
+	Addr         string
+	DBPath       string
+	OwnerName    string
+	LinkTTL      time.Duration
+	HistoryTTL   time.Duration
+	NotifyURL    string
+	NotifyTarget string
 }
 
 type app struct {
-	db        *sql.DB
-	log       *slog.Logger
-	ownerName string
-	linkTTL   time.Duration
-	index     *template.Template
-	static    http.Handler
-	now       func() time.Time
+	db           *sql.DB
+	log          *slog.Logger
+	ownerName    string
+	linkTTL      time.Duration
+	historyTTL   time.Duration
+	notifyURL    string
+	notifyTarget string
+	index        *template.Template
+	static       http.Handler
+	broker       *broker
+	now          func() time.Time
 }
 
 type link struct {
@@ -59,6 +68,8 @@ type link struct {
 	SubmittedBy string `json:"submitted_by"`
 	CreatedAt   string `json:"created_at"`
 	ExpiresAt   string `json:"expires_at"`
+	ReadAt      string `json:"read_at,omitempty"`
+	ReadBy      string `json:"read_by,omitempty"`
 }
 
 type apiError struct {
@@ -76,9 +87,10 @@ type endpointDescription struct {
 
 var publicEndpoints = []endpointDescription{
 	{Method: http.MethodGet, Path: "/api/v1", Description: "List available Linkshare endpoints and expiry policy."},
-	{Method: http.MethodGet, Path: "/api/v1/links", Description: "List unexpired links waiting in an inbox."},
+	{Method: http.MethodGet, Path: "/api/v1/links", Description: "List links waiting in an inbox (state=active) or previously consumed links (state=read)."},
 	{Method: http.MethodPost, Path: "/api/v1/links", Description: "Create an expiring link for the owner or agents. Resending an active URL replaces the previous entry for that target."},
-	{Method: http.MethodDelete, Path: "/api/v1/links/{id}", Description: "Consume or dismiss a link permanently."},
+	{Method: http.MethodGet, Path: "/api/v1/events", Description: "Stream link_created and link_consumed events as server-sent events; keepalive comments arrive every 25 seconds."},
+	{Method: http.MethodDelete, Path: "/api/v1/links/{id}", Description: "Consume or dismiss a link and move it to history."},
 	{Method: http.MethodPatch, Path: "/api/v1/links/{id}", Description: "Legacy consume compatibility; use DELETE for new clients."},
 	{Method: http.MethodGet, Path: "/healthz", Description: "Check service and database health."},
 	{Method: http.MethodGet, Path: "/", Description: "Open the Linkshare web interface."},
@@ -101,7 +113,7 @@ func main() {
 	}
 	defer db.Close()
 
-	a, err := newApp(db, logger, cfg.OwnerName, cfg.LinkTTL)
+	a, err := newApp(db, logger, cfg)
 	if err != nil {
 		logger.Error("initialize application", "error", err)
 		os.Exit(1)
@@ -128,7 +140,7 @@ func main() {
 		}
 	}()
 
-	logger.Info("linkshare listening", "address", cfg.Addr, "database", cfg.DBPath, "link_ttl", cfg.LinkTTL.String())
+	logger.Info("linkshare listening", "address", cfg.Addr, "database", cfg.DBPath, "link_ttl", cfg.LinkTTL.String(), "history_ttl", cfg.HistoryTTL.String())
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
@@ -141,11 +153,30 @@ func loadConfig() (config, error) {
 	if err != nil || linkTTL <= 0 {
 		return config{}, fmt.Errorf("LINKSHARE_LINK_TTL must be a positive duration such as 168h")
 	}
+	rawHistoryTTL := envOr("LINKSHARE_HISTORY_TTL", defaultHistoryTTL.String())
+	historyTTL, err := time.ParseDuration(rawHistoryTTL)
+	if err != nil || historyTTL <= 0 {
+		return config{}, fmt.Errorf("LINKSHARE_HISTORY_TTL must be a positive duration such as 2160h")
+	}
+	notifyURL := envOr("LINKSHARE_NOTIFY_URL", "")
+	if notifyURL != "" {
+		parsed, err := url.Parse(notifyURL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return config{}, fmt.Errorf("LINKSHARE_NOTIFY_URL must be a valid http or https address")
+		}
+	}
+	notifyTarget := envOr("LINKSHARE_NOTIFY_TARGET", "owner")
+	if notifyTarget != "owner" && notifyTarget != "agents" && notifyTarget != "all" {
+		return config{}, fmt.Errorf("LINKSHARE_NOTIFY_TARGET must be owner, agents, or all")
+	}
 	return config{
-		Addr:      envOr("LINKSHARE_ADDR", ":8080"),
-		DBPath:    envOr("LINKSHARE_DB", "./linkshare.db"),
-		OwnerName: envOr("LINKSHARE_OWNER_NAME", "Me"),
-		LinkTTL:   linkTTL,
+		Addr:         envOr("LINKSHARE_ADDR", ":8080"),
+		DBPath:       envOr("LINKSHARE_DB", "./linkshare.db"),
+		OwnerName:    envOr("LINKSHARE_OWNER_NAME", "Me"),
+		LinkTTL:      linkTTL,
+		HistoryTTL:   historyTTL,
+		NotifyURL:    notifyURL,
+		NotifyTarget: notifyTarget,
 	}, nil
 }
 
@@ -216,6 +247,7 @@ func migrateDB(db *sql.DB, now time.Time, ttl time.Duration) error {
 	for _, statement := range []string{
 		"CREATE INDEX IF NOT EXISTS links_target_expiry_id ON links(target, expires_at, id DESC)",
 		"CREATE INDEX IF NOT EXISTS links_url_target ON links(url, target)",
+		"CREATE INDEX IF NOT EXISTS links_target_read_at ON links(target, read_at DESC, id DESC)",
 		"PRAGMA user_version = 3",
 	} {
 		if _, err := tx.Exec(statement); err != nil {
@@ -246,7 +278,7 @@ func newLinksTableSQL(name string) string {
 	)`
 }
 
-func newApp(db *sql.DB, logger *slog.Logger, ownerName string, linkTTL time.Duration) (*app, error) {
+func newApp(db *sql.DB, logger *slog.Logger, cfg config) (*app, error) {
 	indexBytes, err := webFiles.ReadFile("web/index.html")
 	if err != nil {
 		return nil, err
@@ -260,8 +292,10 @@ func newApp(db *sql.DB, logger *slog.Logger, ownerName string, linkTTL time.Dura
 		return nil, err
 	}
 	return &app{
-		db: db, log: logger, ownerName: ownerName, linkTTL: linkTTL, index: index,
+		db: db, log: logger, ownerName: cfg.OwnerName, linkTTL: cfg.LinkTTL, historyTTL: cfg.HistoryTTL,
+		notifyURL: cfg.NotifyURL, notifyTarget: cfg.NotifyTarget, index: index,
 		static: http.StripPrefix("/assets/", http.FileServer(http.FS(assets))),
+		broker: newBroker(),
 		now:    func() time.Time { return time.Now().UTC() },
 	}, nil
 }
@@ -273,6 +307,7 @@ func (a *app) routes() http.Handler {
 	mux.Handle("GET /assets/", a.static)
 	mux.HandleFunc("GET /healthz", a.health)
 	mux.HandleFunc("GET /api/v1", a.discovery)
+	mux.HandleFunc("GET /api/v1/events", a.events)
 	mux.HandleFunc("GET /api/v1/links", a.listLinks)
 	mux.HandleFunc("POST /api/v1/links", a.createLink)
 	mux.HandleFunc("DELETE /api/v1/links/{id}", a.consumeLink)
@@ -294,7 +329,8 @@ func (a *app) discovery(w http.ResponseWriter, _ *http.Request) {
 		"api_version":          "v1",
 		"description":          "One-time link inbox for an owner and coding agents.",
 		"link_ttl_seconds":     int64(a.linkTTL / time.Second),
-		"consumption_behavior": "Consumed links are permanently removed.",
+		"history_ttl_seconds":  int64(a.historyTTL / time.Second),
+		"consumption_behavior": "Consumed links move to history and are retained according to LINKSHARE_HISTORY_TTL.",
 		"endpoints":            publicEndpoints,
 	})
 }
@@ -369,7 +405,7 @@ func (a *app) createLink(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(r.Context(),
-		"DELETE FROM links WHERE url = ? AND target = ? AND expires_at > ?",
+		"DELETE FROM links WHERE url = ? AND target = ? AND expires_at > ? AND read_at IS NULL",
 		input.URL, input.Target, createdAt); err != nil {
 		a.log.Error("replace duplicate links", "error", err)
 		a.writeError(w, http.StatusInternalServerError, "database_error", "could not save link")
@@ -394,6 +430,8 @@ func (a *app) createLink(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusInternalServerError, "database_error", "could not load saved link")
 		return
 	}
+	a.broker.publish("link_created", item)
+	a.notifyCreated(item)
 	a.writeJSON(w, http.StatusCreated, item)
 }
 
@@ -406,38 +444,26 @@ func (a *app) listLinks(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 	switch state {
 	case "", "active", "unread", "all":
+		a.listActive(w, r, target)
 	case "read", "archived":
-		a.writeJSON(w, http.StatusOK, map[string]any{"items": []link{}, "total": 0, "next_before_id": nil})
-		return
+		a.listHistory(w, r, target)
 	default:
 		a.writeError(w, http.StatusUnprocessableEntity, "invalid_state", "state must be active, unread, read, archived, or all")
 		return
 	}
-	limit := defaultLimit
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 1 || parsed > maxLimit {
-			a.writeError(w, http.StatusUnprocessableEntity, "invalid_limit", "limit must be between 1 and 200")
-			return
-		}
-		limit = parsed
-	}
-	var beforeID int64
-	if raw := r.URL.Query().Get("before_id"); raw != "" {
-		parsed, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil || parsed < 1 {
-			a.writeError(w, http.StatusUnprocessableEntity, "invalid_cursor", "before_id must be a positive integer")
-			return
-		}
-		beforeID = parsed
-	}
+}
 
+func (a *app) listActive(w http.ResponseWriter, r *http.Request, target string) {
+	limit, beforeID, ok := a.parsePagination(w, r)
+	if !ok {
+		return
+	}
 	now := a.now().UTC().Format(time.RFC3339Nano)
 	if err := a.cleanupExpired(r.Context()); err != nil {
 		a.writeError(w, http.StatusInternalServerError, "database_error", "could not clean expired links")
 		return
 	}
-	baseWhere := "target = ? AND expires_at > ?"
+	baseWhere := "target = ? AND expires_at > ? AND read_at IS NULL"
 	baseArgs := []any{target, now}
 	var total int
 	if err := a.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM links WHERE "+baseWhere, baseArgs...).Scan(&total); err != nil {
@@ -467,6 +493,76 @@ func (a *app) listLinks(w http.ResponseWriter, r *http.Request) {
 		}
 		items = append(items, item)
 	}
+	a.writePaginated(w, limit, items, total)
+}
+
+func (a *app) listHistory(w http.ResponseWriter, r *http.Request, target string) {
+	limit, beforeID, ok := a.parsePagination(w, r)
+	if !ok {
+		return
+	}
+	now := a.now().UTC()
+	historyCutoff := now.Add(-a.historyTTL).Format(time.RFC3339Nano)
+	if err := a.cleanupExpired(r.Context()); err != nil {
+		a.writeError(w, http.StatusInternalServerError, "database_error", "could not clean expired links")
+		return
+	}
+	baseWhere := "target = ? AND read_at IS NOT NULL AND read_at > ?"
+	baseArgs := []any{target, historyCutoff}
+	var total int
+	if err := a.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM links WHERE "+baseWhere, baseArgs...).Scan(&total); err != nil {
+		a.writeError(w, http.StatusInternalServerError, "database_error", "could not count history")
+		return
+	}
+	query := `SELECT id, url, title, note, target, submitted_by, created_at, expires_at, read_at, read_by FROM links WHERE ` + baseWhere
+	args := append([]any{}, baseArgs...)
+	if beforeID > 0 {
+		query += " AND id < ?"
+		args = append(args, beforeID)
+	}
+	query += " ORDER BY read_at DESC, id DESC LIMIT ?"
+	args = append(args, limit+1)
+	rows, err := a.db.QueryContext(r.Context(), query, args...)
+	if err != nil {
+		a.writeError(w, http.StatusInternalServerError, "database_error", "could not load history")
+		return
+	}
+	defer rows.Close()
+	items := make([]link, 0, limit)
+	for rows.Next() {
+		item, err := scanHistoryLink(rows)
+		if err != nil {
+			a.writeError(w, http.StatusInternalServerError, "database_error", "could not read history")
+			return
+		}
+		items = append(items, item)
+	}
+	a.writePaginated(w, limit, items, total)
+}
+
+func (a *app) parsePagination(w http.ResponseWriter, r *http.Request) (int, int64, bool) {
+	limit := defaultLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > maxLimit {
+			a.writeError(w, http.StatusUnprocessableEntity, "invalid_limit", "limit must be between 1 and 200")
+			return 0, 0, false
+		}
+		limit = parsed
+	}
+	var beforeID int64
+	if raw := r.URL.Query().Get("before_id"); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed < 1 {
+			a.writeError(w, http.StatusUnprocessableEntity, "invalid_cursor", "before_id must be a positive integer")
+			return 0, 0, false
+		}
+		beforeID = parsed
+	}
+	return limit, beforeID, true
+}
+
+func (a *app) writePaginated(w http.ResponseWriter, limit int, items []link, total int) {
 	var next *int64
 	if len(items) > limit {
 		items = items[:limit]
@@ -485,7 +581,7 @@ func (a *app) consumeLink(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := a.deleteLink(r.Context(), id); err != nil {
+	if err := a.markConsumed(r.Context(), id, ""); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			a.writeError(w, http.StatusNotFound, "not_found", "link not found or expired")
 		} else {
@@ -526,7 +622,7 @@ func (a *app) patchLink(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, http.StatusUnprocessableEntity, "invalid_action", "one-time links cannot be restored; use DELETE to consume them")
 		return
 	}
-	if err := a.deleteLink(r.Context(), id); err != nil {
+	if err := a.markConsumed(r.Context(), id, input.Actor); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			a.writeError(w, http.StatusNotFound, "not_found", "link not found or expired")
 		} else {
@@ -546,25 +642,30 @@ func parseLinkID(w http.ResponseWriter, r *http.Request, a *app) (int64, bool) {
 	return id, true
 }
 
-func (a *app) deleteLink(ctx context.Context, id int64) error {
+func (a *app) markConsumed(ctx context.Context, id int64, actor string) error {
 	now := a.now().UTC().Format(time.RFC3339Nano)
-	result, err := a.db.ExecContext(ctx, "DELETE FROM links WHERE id = ? AND expires_at > ?", id, now)
-	if err != nil {
-		return err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 0 {
+	var target string
+	err := a.db.QueryRowContext(ctx,
+		"UPDATE links SET read_at = ?, read_by = ? WHERE id = ? AND read_at IS NULL AND expires_at > ? RETURNING target",
+		now, actor, id, now).Scan(&target)
+	if errors.Is(err, sql.ErrNoRows) {
 		_ = a.cleanupExpired(ctx)
 		return sql.ErrNoRows
 	}
+	if err != nil {
+		return err
+	}
+	a.broker.publish("link_consumed", map[string]any{"id": id, "target": target})
 	return nil
 }
 
 func (a *app) cleanupExpired(ctx context.Context) error {
-	_, err := a.db.ExecContext(ctx, "DELETE FROM links WHERE expires_at <= ?", a.now().UTC().Format(time.RFC3339Nano))
+	now := a.now().UTC().Format(time.RFC3339Nano)
+	historyCutoff := a.now().UTC().Add(-a.historyTTL).Format(time.RFC3339Nano)
+	if _, err := a.db.ExecContext(ctx, "DELETE FROM links WHERE expires_at <= ? AND read_at IS NULL", now); err != nil {
+		return err
+	}
+	_, err := a.db.ExecContext(ctx, "DELETE FROM links WHERE read_at IS NOT NULL AND read_at <= ?", historyCutoff)
 	return err
 }
 
@@ -643,9 +744,135 @@ func scanLink(s scanner) (link, error) {
 	return item, err
 }
 
+func scanHistoryLink(s scanner) (link, error) {
+	var item link
+	err := s.Scan(&item.ID, &item.URL, &item.Title, &item.Note, &item.Target, &item.SubmittedBy, &item.CreatedAt, &item.ExpiresAt, &item.ReadAt, &item.ReadBy)
+	return item, err
+}
+
 func (a *app) getLink(ctx context.Context, id int64) (link, error) {
 	row := a.db.QueryRowContext(ctx, `SELECT id, url, title, note, target, submitted_by, created_at, expires_at FROM links WHERE id = ?`, id)
 	return scanLink(row)
+}
+
+type sseEvent struct {
+	name string
+	data []byte
+}
+
+type broker struct {
+	mu   sync.Mutex
+	subs map[chan sseEvent]struct{}
+}
+
+func newBroker() *broker {
+	return &broker{subs: make(map[chan sseEvent]struct{})}
+}
+
+func (b *broker) subscribe() chan sseEvent {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ch := make(chan sseEvent, 16)
+	b.subs[ch] = struct{}{}
+	return ch
+}
+
+func (b *broker) unsubscribe(ch chan sseEvent) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.subs, ch)
+}
+
+func (b *broker) publish(name string, payload any) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for ch := range b.subs {
+		select {
+		case ch <- sseEvent{name: name, data: data}:
+		default:
+		}
+	}
+}
+
+func (a *app) events(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		a.writeError(w, http.StatusInternalServerError, "streaming_unsupported", "streaming is not supported")
+		return
+	}
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(time.Time{})
+	_ = controller.SetWriteDeadline(time.Time{})
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, "retry: 3000\n\nevent: hello\ndata: {\"service\":\"linkshare\"}\n\n")
+	flusher.Flush()
+
+	ch := a.broker.subscribe()
+	defer a.broker.unsubscribe(ch)
+	keepalive := time.NewTicker(25 * time.Second)
+	defer keepalive.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case ev := <-ch:
+			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.name, ev.data); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-keepalive.C:
+			if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+var notifyClient = &http.Client{Timeout: 10 * time.Second}
+
+func (a *app) notifyCreated(item link) {
+	if a.notifyURL == "" || (a.notifyTarget != "all" && item.Target != a.notifyTarget) {
+		return
+	}
+	go func() {
+		heading := "New Linkshare link for agents"
+		if item.Target == "owner" {
+			heading = "New Linkshare link for you"
+		}
+		lines := make([]string, 0, 3)
+		if item.Title != "" {
+			lines = append(lines, item.Title)
+		}
+		if item.Note != "" {
+			lines = append(lines, item.Note)
+		}
+		lines = append(lines, item.URL)
+		request, err := http.NewRequest(http.MethodPost, a.notifyURL, strings.NewReader(strings.Join(lines, "\n")))
+		if err != nil {
+			a.log.Error("push notification", "error", err)
+			return
+		}
+		request.Header.Set("Content-Type", "text/plain; charset=utf-8")
+		request.Header.Set("Title", heading)
+		request.Header.Set("Click", item.URL)
+		response, err := notifyClient.Do(request)
+		if err != nil {
+			a.log.Error("push notification", "error", err)
+			return
+		}
+		io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		if response.StatusCode >= 300 {
+			a.log.Error("push notification", "status", response.StatusCode)
+		}
+	}()
 }
 
 func (a *app) writeJSON(w http.ResponseWriter, status int, value any) {

@@ -23,6 +23,9 @@ source "$DEPLOY_CONFIG"
 : "${OWNER_NAME:?OWNER_NAME is required}"
 : "${BACKUP_STORAGE:?BACKUP_STORAGE is required}"
 LINK_TTL="${LINK_TTL:-168h}"
+HISTORY_TTL="${HISTORY_TTL:-2160h}"
+NOTIFY_URL="${NOTIFY_URL:-}"
+NOTIFY_TARGET="${NOTIFY_TARGET:-owner}"
 
 DIST_DIR="$ROOT_DIR/dist"
 REMOTE_DIR="/tmp/linkshare-deploy-$$"
@@ -47,13 +50,14 @@ rm -rf "$DIST_DIR"
 docker build --platform linux/amd64 --target artifact --output "type=local,dest=$DIST_DIR" "$ROOT_DIR"
 test -x "$DIST_DIR/linkshare"
 
-python3 - "$ROOT_DIR/deploy/linkshare.env.template" "$DIST_DIR/linkshare.env" "$OWNER_NAME" "$LINKSHARE_PORT" "$LINK_TTL" <<'PY'
+python3 - "$ROOT_DIR/deploy/linkshare.env.template" "$DIST_DIR/linkshare.env" "$OWNER_NAME" "$LINKSHARE_PORT" "$LINK_TTL" "$HISTORY_TTL" "$NOTIFY_URL" "$NOTIFY_TARGET" <<'PY'
 from pathlib import Path
 import sys
 
-template, output, owner, port, link_ttl = sys.argv[1:]
+template, output, owner, port, link_ttl, history_ttl, notify_url, notify_target = sys.argv[1:]
 text = Path(template).read_text(encoding="utf-8")
-text = text.replace("@OWNER_NAME@", owner).replace("@PORT@", port).replace("@LINK_TTL@", link_ttl)
+text = text.replace("@OWNER_NAME@", owner).replace("@PORT@", port).replace("@LINK_TTL@", link_ttl).replace("@HISTORY_TTL@", history_ttl)
+text = text.replace("@NOTIFY_URL@", notify_url).replace("@NOTIFY_TARGET@", notify_target)
 Path(output).write_text(text, encoding="utf-8")
 PY
 
@@ -135,7 +139,7 @@ Use the installed \`\$linkshare\` skill whenever asked to share, save, check, co
 - The trusted-LAN service is configured at \`$URL\`.
 - Send links for $OWNER_NAME to the \`owner\` target.
 - Check the \`agents\` target for links intended for Codex agents.
-- Consume a link only after successfully using it; consumption is permanent.
+- Consume a link only after successfully using it; consumed links move to history and expire automatically.
 - Leave failed or unrelated links waiting. They expire automatically.
 <!-- linkshare:end -->
 EOF
