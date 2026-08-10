@@ -7,6 +7,9 @@ A lightweight two-way link inbox for a person and their coding agents. Linkshare
 - **For me** and **For agents** inboxes
 - Optional titles and notes
 - One-time consumption and automatic seven-day expiry
+- Real-time inbox updates over server-sent events (`/api/v1/events`), with polling fallback
+- Browser notifications (bell toggle) and optional ntfy-compatible push (`LINKSHARE_NOTIFY_URL`)
+- Light and dark themes following the system preference
 - Agent-friendly JSON API and built-in `/guide`
 - Single static Go binary with embedded frontend assets
 - Direct unprivileged Proxmox LXC deployment
@@ -71,6 +74,7 @@ python3 skills/linkshare/scripts/linkshare.py health
 python3 skills/linkshare/scripts/linkshare.py discover
 python3 skills/linkshare/scripts/linkshare.py send https://example.com --title "Example" --actor codex-agent
 python3 skills/linkshare/scripts/linkshare.py list --target agents
+python3 skills/linkshare/scripts/linkshare.py watch --target agents --timeout 60
 python3 skills/linkshare/scripts/linkshare.py consume 12
 ```
 
@@ -92,6 +96,9 @@ curl 'http://LINKSHARE_HOST:8080/api/v1/links?target=agents'
 
 # Mark one consumed
 curl -X DELETE http://LINKSHARE_HOST:8080/api/v1/links/1
+
+# Stream link_created / link_consumed events as they happen
+curl -N http://LINKSHARE_HOST:8080/api/v1/events
 ```
 
 Links are permanently removed when consumed and otherwise expire after seven days. Results are newest-first; `limit` defaults to 50 and accepts up to 200. Resending an active URL to the same target replaces the previous entry, so retries never pile up.
@@ -114,3 +121,8 @@ Runtime configuration:
 | `LINKSHARE_DB` | `./linkshare.db` | SQLite database path |
 | `LINKSHARE_OWNER_NAME` | `Me` | Browser actor label |
 | `LINKSHARE_LINK_TTL` | `168h` | Lifetime for new links |
+| `LINKSHARE_HISTORY_TTL` | `2160h` | Retention for consumed links |
+| `LINKSHARE_NOTIFY_URL` | _(empty)_ | Optional push endpoint POSTed on new links; works with an [ntfy](https://ntfy.sh) topic URL |
+| `LINKSHARE_NOTIFY_TARGET` | `owner` | Which links push: `owner`, `agents`, or `all` |
+
+Browser notifications need a secure context (HTTPS or `localhost`) in most browsers; on a plain-http LAN address, use `LINKSHARE_NOTIFY_URL` push instead.

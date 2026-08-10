@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -111,6 +112,57 @@ def request_json(
         raise ClientError("Linkshare returned invalid JSON") from exc
 
 
+def watch_for_link(base_url: str, target: str, timeout: float) -> dict[str, Any]:
+    """Block on /api/v1/events until a link for `target` is created.
+
+    The server sends keepalive comments every 25 seconds, so a stalled read
+    means the connection is dead and reconnecting is safe.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ClientError(f"no {target} link arrived within {timeout:.0f}s")
+        request = Request(
+            f"{base_url}/api/v1/events",
+            headers={
+                "Accept": "text/event-stream",
+                "Cache-Control": "no-store",
+                "User-Agent": "linkshare-skill/1",
+            },
+        )
+        try:
+            with urlopen(request, timeout=min(30.0, max(1.0, remaining))) as response:
+                event_name = ""
+                data_lines: list[str] = []
+                while time.monotonic() < deadline:
+                    line = response.readline()
+                    if not line:
+                        break
+                    text = line.decode("utf-8", "replace").rstrip("\r\n")
+                    if text.startswith(":"):
+                        continue
+                    if text.startswith("event:"):
+                        event_name = text[6:].strip()
+                    elif text.startswith("data:"):
+                        data_lines.append(text[5:].strip())
+                    elif text == "":
+                        if event_name == "link_created" and data_lines:
+                            try:
+                                item = json.loads("\n".join(data_lines))
+                            except json.JSONDecodeError:
+                                item = None
+                            if isinstance(item, dict) and item.get("target") == target:
+                                return item
+                        event_name = ""
+                        data_lines = []
+        except HTTPError as exc:
+            raise ClientError(f"Linkshare returned HTTP {exc.code}") from exc
+        except (URLError, TimeoutError, OSError):
+            pass
+        time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Use the Linkshare homelab service")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -135,8 +187,12 @@ def build_parser() -> argparse.ArgumentParser:
     list_parser.add_argument("--limit", type=int, choices=range(1, 201), default=50)
     list_parser.add_argument("--before-id", type=int)
 
-    consume = commands.add_parser("consume", help="Permanently remove a used link")
+    consume = commands.add_parser("consume", help="Mark a used link as consumed")
     consume.add_argument("id", type=int)
+
+    watch = commands.add_parser("watch", help="Wait for the next link to arrive")
+    watch.add_argument("--target", choices=("owner", "agents"), default="agents")
+    watch.add_argument("--timeout", type=float, default=60.0, help="Seconds to wait (default 60)")
 
     action = commands.add_parser("action", help=argparse.SUPPRESS)
     action.add_argument("id", type=int)
@@ -189,6 +245,11 @@ def run(args: argparse.Namespace) -> Any:
             raise ClientError("link id must be positive")
         request_json(base_url, "DELETE", f"/api/v1/links/{args.id}")
         return {"consumed": True, "id": args.id}
+
+    if args.command == "watch":
+        if args.timeout <= 0:
+            raise ClientError("timeout must be positive")
+        return watch_for_link(base_url, args.target, args.timeout)
 
     if args.command == "action":
         if args.id < 1:

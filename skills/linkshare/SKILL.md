@@ -16,6 +16,7 @@ python3 scripts/linkshare.py discover
 python3 scripts/linkshare.py health
 python3 scripts/linkshare.py send URL --title "Title" --note "Why it matters" --actor "agent-name"
 python3 scripts/linkshare.py list --target agents
+python3 scripts/linkshare.py watch --target agents --timeout 60
 python3 scripts/linkshare.py consume ID
 ```
 
@@ -39,7 +40,11 @@ Do not post merely because a URL appeared in conversation. Never place credentia
 4. Run `consume ID` only after successful use.
 5. Report which IDs were consumed and what was used.
 
-Consumption is permanent. Leave failed, inaccessible, and unrelated links waiting; they expire automatically.
+## Wait for a link
+
+When asked to wait for a link that has not arrived yet, run `list` first; if the inbox is empty, run `watch --target agents --timeout 60`. It blocks until the next matching link is created, prints it as JSON, and exits nonzero if nothing arrives before the timeout. Raise `--timeout` only when the user asked for a longer wait.
+
+Consumed links are kept in history (`list --target agents --state read`) and expire automatically according to the server's history TTL.
 
 ## Failure handling
 

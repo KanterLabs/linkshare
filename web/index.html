@@ -4,7 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="owner-name" content="{{.OwnerName}}">
+  <meta name="theme-color" content="#fafbfa" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#121614" media="(prefers-color-scheme: dark)">
   <title>Linkshare</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23176b4d'/%3E%3Cpath d='M24 40 40 24M27 24h13v13' fill='none' stroke='%23fff' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/assets/style.css">
   <script src="/assets/app.js" defer></script>
 </head>
@@ -45,12 +48,16 @@
     <section class="inbox" aria-labelledby="inbox-heading">
       <div class="inbox-topline">
         <h2 id="inbox-heading">Waiting for you</h2>
-        <span id="updated" class="updated" role="status"></span>
+        <span id="updated" class="updated" role="status"><span id="live-dot" class="live-dot" aria-hidden="true"></span><span id="updated-text"></span></span>
+        <button id="notify" class="icon-button" type="button" aria-pressed="false" aria-label="Notify me when links arrive" title="Notify me when links arrive">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+        </button>
         <button id="refresh" class="icon-button" type="button" aria-label="Refresh links" title="Refresh">↻</button>
       </div>
       <div class="tabs" role="tablist" aria-label="Link inboxes">
-        <button class="tab active" data-target="owner" role="tab" aria-selected="true">Me <span id="owner-count">0</span></button>
-        <button class="tab" data-target="agents" role="tab" aria-selected="false">Agents <span id="agents-count">0</span></button>
+        <button class="tab active" data-target="owner" data-mode="inbox" role="tab" aria-selected="true">Me <span id="owner-count">0</span></button>
+        <button class="tab" data-target="agents" data-mode="inbox" role="tab" aria-selected="false">Agents <span id="agents-count">0</span></button>
+        <button class="tab" data-mode="history" role="tab" aria-selected="false">History</button>
       </div>
       <div id="notice" class="notice" hidden role="alert"></div>
       <div id="links" class="links" aria-live="polite"></div>

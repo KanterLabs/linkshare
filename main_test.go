@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"io"
@@ -21,12 +23,17 @@ var testNow = time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
 
 func testApp(t *testing.T) (*app, http.Handler) {
 	t.Helper()
+	return testAppConfig(t, config{OwnerName: "Me", LinkTTL: defaultTTL, HistoryTTL: defaultHistoryTTL, NotifyTarget: "owner"})
+}
+
+func testAppConfig(t *testing.T, cfg config) (*app, http.Handler) {
+	t.Helper()
 	db, err := openDB(filepath.Join(t.TempDir(), "linkshare.db"), testNow, defaultTTL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	a, err := newApp(db, slog.New(slog.NewTextHandler(io.Discard, nil)), "Me", defaultTTL)
+	a, err := newApp(db, slog.New(slog.NewTextHandler(io.Discard, nil)), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,6 +78,10 @@ func TestOneTimeLinkLifecycle(t *testing.T) {
 	consumed := requestJSON(t, handler, http.MethodDelete, "/api/v1/links/1", "")
 	if consumed.Code != http.StatusNoContent || consumed.Body.Len() != 0 {
 		t.Fatalf("consume response = %d %s", consumed.Code, consumed.Body.String())
+	}
+	history := requestJSON(t, handler, http.MethodGet, "/api/v1/links?target=agents&state=read", "")
+	if history.Code != http.StatusOK || !strings.Contains(history.Body.String(), `"total":1`) {
+		t.Fatalf("history response = %d %s", history.Code, history.Body.String())
 	}
 	missing := requestJSON(t, handler, http.MethodDelete, "/api/v1/links/1", "")
 	if missing.Code != http.StatusNotFound {
@@ -172,6 +183,10 @@ func TestLegacyAPICompatibility(t *testing.T) {
 	if consumed.Code != http.StatusOK || !strings.Contains(consumed.Body.String(), `"consumed":true`) {
 		t.Fatalf("legacy consume = %d %s", consumed.Code, consumed.Body.String())
 	}
+	history := requestJSON(t, handler, http.MethodGet, "/api/v1/links?target=agents&state=read", "")
+	if history.Code != http.StatusOK || !strings.Contains(history.Body.String(), `"total":1`) {
+		t.Fatalf("legacy history = %d %s", history.Code, history.Body.String())
+	}
 }
 
 func TestDiscoveryDocument(t *testing.T) {
@@ -181,15 +196,16 @@ func TestDiscoveryDocument(t *testing.T) {
 		t.Fatalf("discovery status = %d; body = %s", response.Code, response.Body.String())
 	}
 	var document struct {
-		Service        string                `json:"service"`
-		APIVersion     string                `json:"api_version"`
-		LinkTTLSeconds int64                 `json:"link_ttl_seconds"`
-		Endpoints      []endpointDescription `json:"endpoints"`
+		Service           string                `json:"service"`
+		APIVersion        string                `json:"api_version"`
+		LinkTTLSeconds    int64                 `json:"link_ttl_seconds"`
+		HistoryTTLSeconds int64                 `json:"history_ttl_seconds"`
+		Endpoints         []endpointDescription `json:"endpoints"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Service != "linkshare" || document.APIVersion != "v1" || document.LinkTTLSeconds != 604800 {
+	if document.Service != "linkshare" || document.APIVersion != "v1" || document.LinkTTLSeconds != 604800 || document.HistoryTTLSeconds != 7776000 {
 		t.Fatalf("unexpected discovery metadata: %+v", document)
 	}
 	found := make(map[string]string)
@@ -197,8 +213,8 @@ func TestDiscoveryDocument(t *testing.T) {
 		found[endpoint.Method+" "+endpoint.Path] = endpoint.Description
 	}
 	for _, expected := range []string{
-		"GET /api/v1", "GET /api/v1/links", "POST /api/v1/links", "DELETE /api/v1/links/{id}",
-		"PATCH /api/v1/links/{id}", "GET /healthz", "GET /", "GET /guide",
+		"GET /api/v1", "GET /api/v1/links", "POST /api/v1/links", "GET /api/v1/events",
+		"DELETE /api/v1/links/{id}", "PATCH /api/v1/links/{id}", "GET /healthz", "GET /", "GET /guide",
 	} {
 		if found[expected] == "" {
 			t.Errorf("discovery document is missing %s", expected)
@@ -309,7 +325,8 @@ func TestIndexEscapesOwnerName(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	a, err := newApp(db, slog.New(slog.NewTextHandler(io.Discard, nil)), `"><script>alert(1)</script>`, defaultTTL)
+	a, err := newApp(db, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		config{OwnerName: `"><script>alert(1)</script>`, LinkTTL: defaultTTL, HistoryTTL: defaultHistoryTTL, NotifyTarget: "owner"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,5 +334,186 @@ func TestIndexEscapesOwnerName(t *testing.T) {
 	a.routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
 	if response.Code != http.StatusOK || strings.Contains(response.Body.String(), "<script>alert(1)</script>") {
 		t.Fatalf("owner name was not escaped: %s", response.Body.String())
+	}
+}
+
+func TestHistoryPurge(t *testing.T) {
+	a, handler := testApp(t)
+	if response := requestJSON(t, handler, http.MethodPost, "/api/v1/links", `{"url":"https://example.com/old","target":"owner","submitted_by":"tester"}`); response.Code != http.StatusCreated {
+		t.Fatal(response.Body.String())
+	}
+	if response := requestJSON(t, handler, http.MethodDelete, "/api/v1/links/1", ""); response.Code != http.StatusNoContent {
+		t.Fatalf("consume = %d %s", response.Code, response.Body.String())
+	}
+	a.now = func() time.Time { return testNow.Add(defaultHistoryTTL).Add(time.Hour) }
+	if response := requestJSON(t, handler, http.MethodGet, "/api/v1/links?target=owner&state=read", ""); response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"total":0`) {
+		t.Fatalf("history after purge = %d %s", response.Code, response.Body.String())
+	}
+	var count int
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM links").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("history rows remaining = %d, err = %v", count, err)
+	}
+}
+
+func TestReshareAfterConsume(t *testing.T) {
+	_, handler := testApp(t)
+	if response := requestJSON(t, handler, http.MethodPost, "/api/v1/links", `{"url":"https://example.com/page","target":"owner","submitted_by":"tester"}`); response.Code != http.StatusCreated {
+		t.Fatal(response.Body.String())
+	}
+	if response := requestJSON(t, handler, http.MethodDelete, "/api/v1/links/1", ""); response.Code != http.StatusNoContent {
+		t.Fatalf("consume = %d %s", response.Code, response.Body.String())
+	}
+	reshare := requestJSON(t, handler, http.MethodPost, "/api/v1/links", `{"url":"https://example.com/page","target":"owner","submitted_by":"tester"}`)
+	if reshare.Code != http.StatusCreated {
+		t.Fatalf("reshare = %d %s", reshare.Code, reshare.Body.String())
+	}
+	var item link
+	if err := json.Unmarshal(reshare.Body.Bytes(), &item); err != nil || item.ID <= 1 {
+		t.Fatalf("unexpected reshare: %+v, err=%v", item, err)
+	}
+	waiting := requestJSON(t, handler, http.MethodGet, "/api/v1/links?target=owner", "")
+	if waiting.Code != http.StatusOK || !strings.Contains(waiting.Body.String(), `"total":1`) {
+		t.Fatalf("active after reshare = %d %s", waiting.Code, waiting.Body.String())
+	}
+	history := requestJSON(t, handler, http.MethodGet, "/api/v1/links?target=owner&state=read", "")
+	if history.Code != http.StatusOK || !strings.Contains(history.Body.String(), `"total":1`) {
+		t.Fatalf("history after reshare = %d %s", history.Code, history.Body.String())
+	}
+}
+
+func TestEventsStream(t *testing.T) {
+	_, handler := testApp(t)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/api/v1/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK || response.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("events response = %d %s", response.StatusCode, response.Header.Get("Content-Type"))
+	}
+
+	type streamEvent struct{ name, data string }
+	events := make(chan streamEvent, 8)
+	go func() {
+		scanner := bufio.NewScanner(response.Body)
+		var name, data string
+		for scanner.Scan() {
+			line := scanner.Text()
+			switch {
+			case strings.HasPrefix(line, "event: "):
+				name = strings.TrimPrefix(line, "event: ")
+			case strings.HasPrefix(line, "data: "):
+				data = strings.TrimPrefix(line, "data: ")
+			case line == "":
+				if name != "" {
+					events <- streamEvent{name: name, data: data}
+				}
+				name, data = "", ""
+			}
+		}
+	}()
+	waitEvent := func(want string) string {
+		t.Helper()
+		timeout := time.After(5 * time.Second)
+		for {
+			select {
+			case ev := <-events:
+				if ev.name == want {
+					return ev.data
+				}
+			case <-timeout:
+				t.Fatalf("timed out waiting for %s event", want)
+			}
+		}
+	}
+	waitEvent("hello")
+
+	created, err := http.Post(server.URL+"/api/v1/links", "application/json",
+		strings.NewReader(`{"url":"https://example.com/live","target":"owner","submitted_by":"codex"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	created.Body.Close()
+	if created.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d", created.StatusCode)
+	}
+	createdEvent := waitEvent("link_created")
+	if !strings.Contains(createdEvent, `"url":"https://example.com/live"`) || !strings.Contains(createdEvent, `"target":"owner"`) {
+		t.Fatalf("unexpected link_created payload: %s", createdEvent)
+	}
+
+	remove, err := http.NewRequest(http.MethodDelete, server.URL+"/api/v1/links/1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, err := http.DefaultClient.Do(remove)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed.Body.Close()
+	if removed.StatusCode != http.StatusNoContent {
+		t.Fatalf("consume status = %d", removed.StatusCode)
+	}
+	consumedEvent := waitEvent("link_consumed")
+	if !strings.Contains(consumedEvent, `"id":1`) || !strings.Contains(consumedEvent, `"target":"owner"`) {
+		t.Fatalf("unexpected link_consumed payload: %s", consumedEvent)
+	}
+}
+
+func TestNotifyPushOnCreate(t *testing.T) {
+	type push struct{ title, click, body string }
+	received := make(chan push, 4)
+	notify := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		received <- push{title: r.Header.Get("Title"), click: r.Header.Get("Click"), body: string(body)}
+	}))
+	defer notify.Close()
+
+	_, handler := testAppConfig(t, config{OwnerName: "Me", LinkTTL: defaultTTL, HistoryTTL: defaultHistoryTTL, NotifyURL: notify.URL, NotifyTarget: "owner"})
+	if response := requestJSON(t, handler, http.MethodPost, "/api/v1/links", `{"url":"https://example.com/skip","target":"agents","submitted_by":"codex"}`); response.Code != http.StatusCreated {
+		t.Fatal(response.Body.String())
+	}
+	if response := requestJSON(t, handler, http.MethodPost, "/api/v1/links", `{"url":"https://example.com/ping","title":"Read me","target":"owner","submitted_by":"codex"}`); response.Code != http.StatusCreated {
+		t.Fatal(response.Body.String())
+	}
+
+	select {
+	case got := <-received:
+		if got.title != "New Linkshare link for you" || got.click != "https://example.com/ping" {
+			t.Fatalf("unexpected push: %+v", got)
+		}
+		if !strings.Contains(got.body, "Read me") || !strings.Contains(got.body, "https://example.com/ping") {
+			t.Fatalf("unexpected push body: %q", got.body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no push notification received")
+	}
+	select {
+	case got := <-received:
+		t.Fatalf("agents-targeted link should not push: %+v", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestHistoryByActor(t *testing.T) {
+	_, handler := testApp(t)
+	if response := requestJSON(t, handler, http.MethodPost, "/api/v1/links", `{"url":"https://example.com/agent","target":"agents","submitted_by":"Me"}`); response.Code != http.StatusCreated {
+		t.Fatal(response.Body.String())
+	}
+	if response := requestJSON(t, handler, http.MethodPatch, "/api/v1/links/1", `{"action":"mark_read","actor":"codex"}`); response.Code != http.StatusOK {
+		t.Fatalf("consume = %d %s", response.Code, response.Body.String())
+	}
+	response := requestJSON(t, handler, http.MethodGet, "/api/v1/links?target=agents&state=read", "")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"read_by":"codex"`) {
+		t.Fatalf("history by actor = %d %s", response.Code, response.Body.String())
 	}
 }
