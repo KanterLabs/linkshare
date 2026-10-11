@@ -9,10 +9,15 @@ permissions:
 
 jobs:
   validate:
-    runs-on: homelab
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
       - uses: actions/setup-go@v6
         with:
           go-version: "1.24.x"
